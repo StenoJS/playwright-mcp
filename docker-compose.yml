@@ -1,0 +1,126 @@
+# Playwright MCP-servers voor Bol.com en Amazon, met noVNC erbij.
+#
+# Draait op de Home Assistant-host, beheerd via Portainer (endpoint "primary",
+# stack "playwright-mcp", id 10). Alleen privé bereikbaar (Tailscale/LAN) --
+# geen publiek steno.nl-adres, want @playwright/mcp heeft geen ingebouwde
+# authenticatie en bestuurt een browser die is ingelogd met echte
+# account-cookies. Dat geldt ook voor de noVNC-poorten hieronder: die staan
+# alleen open op het LAN/Tailnet, nooit via Nginx Proxy Manager naar buiten.
+#
+# Werking sessies/inloggen:
+# Elke container draait Chromium HEADED in een virtueel scherm (Xvfb) en
+# bewaart het Chrome-profiel (cookies, localStorage, login) persistent in
+# /data/profile op het eigen volume -- niet meer als los storage-state.json
+# bestand. Inloggen doe je visueel via noVNC in je browser, zonder wachtwoord
+# (bewuste keuze: alleen LAN/Tailnet-bereikbaar, zie hierboven):
+#   http://100.98.53.42:6090/vnc.html   (bol)
+#   http://100.98.53.42:6091/vnc.html   (amazon)
+# (Poort 6080 was al bezet door de bestaande familylink-playwright HA-addon.)
+# Eenmaal ingelogd blijft dat, zolang het volume/profiel blijft bestaan; geen
+# lokale save-session.js + scp/docker cp-stappen meer nodig (dat script staat
+# er nog als fallback, zie README).
+#
+# xvfb/x11vnc/novnc/websockify worden bij het opstarten via apt geïnstalleerd
+# in de officiële image (geen losse build/registry nodig, past bij
+# StackUpdate dat alleen dit ene compose-bestand deployt). Kost een paar
+# seconden extra bij een (her)start van de container.
+#
+# shm_size: 1gb -- Docker's default /dev/shm (64M) is te klein voor een
+# headed Chromium op zwaardere sites (Amazon crashte hierop, "Aw, Snap!").
+#
+# --allowed-hosts="*" -- @playwright/mcp weigert anders elk verzoek waarvan
+# de Host-header niet exact "localhost" is (DNS-rebinding-bescherming), ook al
+# bind je met --host=0.0.0.0. Zonder deze flag krijg je 403 "Access is only
+# allowed at localhost" op elke verbinding via het Tailscale-IP. Acceptabel
+# hier omdat de poorten toch al alleen privé bereikbaar zijn (zie hierboven).
+#
+# Bron kant-en-klare basisimage: https://github.com/microsoft/playwright-mcp
+
+x-vnc-entrypoint: &vnc-entrypoint |
+  set -e
+  # Xvfb zit al in de basisimage; x11vnc/novnc/websockify/fluxbox niet -- die
+  # zijn de echte indicator of de apt-install nog moet draaien.
+  if ! command -v x11vnc >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox
+    rm -rf /var/lib/apt/lists/*
+  fi
+
+  mkdir -p "$$PROFILE_DIR"
+
+  # Ruim stale locks op van een sessie die niet netjes is afgesloten (crash,
+  # verbroken verbinding, oom-kill). Die overleven een `docker restart` --
+  # zowel /tmp/.X99-lock van Xvfb (zelfde container-laag) als de Chromium
+  # Singleton*-bestanden in het persistente profiel op het volume -- en
+  # blokkeren anders élke volgende start met "Server is already active for
+  # display 99" resp. "Browser is already in use for /data/profile", zonder
+  # dat er nog een echt proces draait.
+  rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+  rm -f "$$PROFILE_DIR/SingletonLock" "$$PROFILE_DIR/SingletonSocket" "$$PROFILE_DIR/SingletonCookie"
+
+  Xvfb :99 -screen 0 1280x800x24 &
+  sleep 1
+  fluxbox >/var/log/fluxbox.log 2>&1 &
+
+  x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o /var/log/x11vnc.log
+
+  websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+
+  exec node /app/cli.js \
+    --browser=chromium \
+    --no-sandbox \
+    --port="$$MCP_PORT" \
+    --host=0.0.0.0 \
+    --allowed-hosts="*" \
+    --user-data-dir="$$PROFILE_DIR"
+
+services:
+  playwright-bol:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-bol-mcp
+    restart: unless-stopped
+    pull_policy: always
+    user: "0:0"
+    shm_size: "1gb"
+    environment:
+      DISPLAY: ":99"
+      MCP_PORT: "8931"
+      PROFILE_DIR: "/data/profile"
+    entrypoint: ["/bin/bash", "-c"]
+    command: [*vnc-entrypoint]
+    ports:
+      - "8931:8931"
+      - "6090:6080"
+    volumes:
+      - playwright-bol-data:/data
+    networks:
+      - hassio
+
+  playwright-amazon:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-amazon-mcp
+    restart: unless-stopped
+    pull_policy: always
+    user: "0:0"
+    shm_size: "1gb"
+    environment:
+      DISPLAY: ":99"
+      MCP_PORT: "8932"
+      PROFILE_DIR: "/data/profile"
+    entrypoint: ["/bin/bash", "-c"]
+    command: [*vnc-entrypoint]
+    ports:
+      - "8932:8932"
+      - "6091:6080"
+    volumes:
+      - playwright-amazon-data:/data
+    networks:
+      - hassio
+
+volumes:
+  playwright-bol-data:
+  playwright-amazon-data:
+
+networks:
+  hassio:
+    external: true
